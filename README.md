@@ -146,3 +146,4 @@ No tracking issue existed upstream for either at the time of writing.
 - IPv6 is not shown (IPv4 only). Easy to add.
 - Schema parsing targets the current limactl output. If a field moves, the blast
   radius is `merge_network_list`, `parse_networks_yaml`, and `_instance_networks`.
+# lima-tui
