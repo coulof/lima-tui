@@ -1,0 +1,653 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["textual>=0.60", "pyyaml>=6"]
+# ///
+# <limactl-desc>Draw which Lima VM is on which network (vSwitch), NIC and IP</limactl-desc>
+"""
+limactl-net — a Lima CLI plugin (a Textual TUI) that draws which Lima VM is
+wired to which network (vSwitch), on which NIC, with which IP.
+
+Installed as `limactl-net` on PATH, it runs as `limactl net`.
+
+Each Lima network is one vSwitch panel. Networks come from
+`limactl network list` (for names) zipped with `--json` (for details) — a
+workaround for the JSON output dropping the name — so even unused networks
+show. Live IPs come from inside each guest via
+`limactl shell <vm> -- ip -d -j addr show`, correlated to configured networks
+by MAC, then interface name, then IP subnet.
+
+CNI noise (cni0, flannel.1, cali*/cilium_*, veth*, kube-ipvs0, ovn0, docker0 …)
+is filtered out: those are virtual devices with an `info_kind`; a real VM NIC is
+virtio with none. The built-in usermode network is shown separately as a
+per-VM NAT, not a shared bus.
+
+    limactl net                # as a plugin (after install; see README)
+    ./limactl-net --demo       # direct; the uv shebang installs deps
+    uv run limactl-net --demo  # canned data, no Lima needed
+    limactl net --print        # dump to stdout, no TUI
+    limactl net --dump         # diagnostic: config network[] vs guest NICs
+
+Keys:  r refresh   t toggle vSwitch / VM view   q quit
+"""
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import subprocess
+from dataclasses import dataclass, field
+
+USER_V2 = "usermode NAT (default, per-VM)"
+
+# ----------------------------------------------------------------------------
+# Data model
+# ----------------------------------------------------------------------------
+
+@dataclass
+class Nic:
+    vm: str
+    status: str
+    ifname: str
+    mac: str
+    ips: list[str] = field(default_factory=list)
+
+
+@dataclass
+class VSwitch:
+    name: str
+    kind: str           # shared | bridged | host | socket | user-v2 | vznat | unknown
+    shared: bool        # true L2 segment vs per-VM NAT
+    subnet: str | None = None
+    gateway: str | None = None
+    iface: str | None = None
+    nics: list[Nic] = field(default_factory=list)
+
+
+# ----------------------------------------------------------------------------
+# Pure parsers (no subprocess — unit-testable)
+# ----------------------------------------------------------------------------
+
+def parse_instances(out: str) -> list[dict]:
+    """`limactl list --json` is historically JSONL; newer builds emit an array."""
+    out = out.strip()
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+        return data if isinstance(data, list) else [data]
+    except json.JSONDecodeError:
+        return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def parse_guest_ifaces(out: str, keep_virtual: bool = False) -> list[dict]:
+    """From `ip -d -j addr show`, return [{mac, ifname, ips}] for REAL NICs only,
+    in kernel order.
+
+    A real VM NIC is link_type=ether, not loopback, and has no `info_kind`
+    (virtio). CNI/virtual devices (veth, bridge, vxlan, dummy, …) carry an
+    info_kind and are dropped unless keep_virtual is set.
+    """
+    result: list[dict] = []
+    for e in json.loads(out):
+        ifname = e.get("ifname")
+        if ifname == "lo":
+            continue
+        if e.get("link_type") != "ether":
+            continue
+        info_kind = (e.get("linkinfo") or {}).get("info_kind")
+        if info_kind and not keep_virtual:
+            continue
+        mac = e.get("address")
+        if not mac:
+            continue
+        ips = [a["local"] for a in e.get("addr_info", []) if a.get("family") == "inet"]
+        result.append({"mac": mac, "ifname": ifname, "ips": ips})
+    return result
+
+
+def _cidr(gateway: str | None, netmask: str | None) -> str | None:
+    if not (gateway and netmask):
+        return None
+    try:
+        return str(ipaddress.ip_network(f"{gateway}/{netmask}", strict=False))
+    except ValueError:
+        return None
+
+
+def parse_networks_yaml(text: str) -> dict[str, dict]:
+    import yaml
+    data = yaml.safe_load(text) or {}
+    nets: dict[str, dict] = {}
+    for name, cfg in (data.get("networks") or {}).items():
+        cfg = cfg or {}
+        nets[name] = {
+            "mode": cfg.get("mode", "?"),
+            "gateway": cfg.get("gateway"),
+            "netmask": cfg.get("netmask"),
+            "interface": cfg.get("interface"),
+            "cidr": _cidr(cfg.get("gateway"), cfg.get("netmask")),
+        }
+    return nets
+
+
+def parse_network_table(text: str) -> list[str]:
+    """Extract network names (first column) from `limactl network list`."""
+    names: list[str] = []
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line or line.startswith("NAME"):
+            continue
+        names.append(line.split()[0])
+    return names
+
+
+def merge_network_list(table_text: str, json_text: str) -> dict[str, dict]:
+    """Workaround for lima-vm/lima: `network list --json` drops the name.
+
+    The name is the map key in limactl and never lands in the marshalled
+    object, so JSON rows are anonymous. The table output still carries NAME.
+    Both branches iterate the same sorted slice, so we zip the names from the
+    table onto the detail rows from JSON, positionally.
+    """
+    names = parse_network_table(table_text)
+    rows = parse_instances(json_text)  # same JSONL/array tolerance
+    defs: dict[str, dict] = {}
+    for name, nw in zip(names, rows):
+        defs[name] = {
+            "mode": nw.get("mode", "?"),
+            "gateway": nw.get("gateway"),
+            "netmask": nw.get("netmask"),
+            "interface": nw.get("interface"),
+            "cidr": _cidr(nw.get("gateway"), nw.get("netmask")),
+        }
+    return defs
+
+
+def _instance_networks(inst: dict) -> list[dict]:
+    """Configured networks for an instance.
+
+    NOTE: `limactl list --json` emits this under the **singular** key
+    `network` (the Instance struct tags it `json:"network"`), even though the
+    on-disk lima.yaml and the LimaYAML struct use the plural `networks`. We
+    accept both, plus a nested `config.networks`, for robustness.
+    """
+    return (inst.get("network")
+            or inst.get("networks")
+            or (inst.get("config") or {}).get("networks")
+            or [])
+
+
+def _match_subnet_label(ips: list[str], defs: dict) -> str | None:
+    """Return the name of the first defined network whose CIDR contains one of
+    the given IPs. Best-effort only: ambiguous when two networks share a
+    subnet (e.g. shared vs user-v2-egress), so this is a last resort after
+    MAC/interface matching."""
+    for ip in ips:
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        for name, d in defs.items():
+            cidr = d.get("cidr")
+            if not cidr:
+                continue
+            try:
+                if addr in ipaddress.ip_network(cidr):
+                    return name
+            except ValueError:
+                continue
+    return None
+
+
+def _label_for(net: dict, defs: dict) -> tuple[str, str, bool]:
+    if net.get("lima"):
+        nm = net["lima"]
+        mode = (defs.get(nm) or {}).get("mode", "shared")
+        return f"lima:{nm}", mode, mode in ("shared", "bridged", "host")
+    if net.get("socket"):
+        return f"socket:{os.path.basename(net['socket'])}", "socket", True
+    if net.get("vzNAT"):
+        return "vzNAT (per-VM NAT)", "vznat", False
+    return "unknown", "unknown", False
+
+
+# ----------------------------------------------------------------------------
+# Backends (real Lima vs demo)
+# ----------------------------------------------------------------------------
+
+def _run(cmd: list[str]) -> str:
+    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+
+
+class RealBackend:
+    def __init__(self, lima_home: str | None = None, use_yaml: bool = True):
+        self.home = lima_home or os.environ.get("LIMA_HOME") or os.path.expanduser("~/.lima")
+        self.use_yaml = use_yaml
+
+    def list_instances(self) -> list[dict]:
+        insts = parse_instances(_run(["limactl", "list", "--json"]))
+        # Defensive: if an instance surfaced no networks (some limactl versions
+        # omit them), read the on-disk lima.yaml via its `dir` field.
+        for inst in insts:
+            if _instance_networks(inst):
+                continue
+            d = inst.get("dir")
+            if not d:
+                continue
+            try:
+                import yaml
+                with open(os.path.join(d, "lima.yaml")) as f:
+                    y = yaml.safe_load(f) or {}
+                if y.get("networks"):
+                    inst["networks"] = y["networks"]
+            except (OSError, Exception):
+                pass
+        return insts
+
+    def guest_addr_json(self, name: str) -> str:
+        return _run(["limactl", "shell", name, "--", "ip", "-d", "-j", "addr", "show"])
+
+    def network_defs(self) -> dict[str, dict]:
+        # Prefer limactl (honours its own LIMA_HOME resolution). Because
+        # `network list --json` omits the name, zip the JSON details against
+        # the table output, which still has NAME. See lima-vm/lima.
+        try:
+            table = _run(["limactl", "network", "list"])
+            js = _run(["limactl", "network", "list", "--json"])
+            defs = merge_network_list(table, js)
+            if defs:
+                return defs
+        except Exception:
+            pass
+        # Fallback: read networks.yaml directly (keys are the names).
+        if self.use_yaml:
+            try:
+                with open(os.path.join(self.home, "_config", "networks.yaml")) as f:
+                    return parse_networks_yaml(f.read())
+            except OSError:
+                pass
+        return {}
+
+
+class DemoBackend:
+    """Canned data that exercises the CNI filter and unused-network display."""
+
+    NETWORK_TABLE = """\
+NAME              MODE       GATEWAY             INTERFACE
+bridged           bridged    -                   en0
+host              host       192.168.106.1/24    -
+shared            shared     192.168.105.1/24    -
+user-v2           user-v2    192.168.104.1/24    -
+user-v2-egress    user-v2    192.168.105.1/24    -
+user-v2-node      user-v2    192.168.106.1/24    -
+"""
+
+    # Note: anonymous on purpose — this mirrors the upstream bug where
+    # `network list --json` emits no name. We recover it from the table above.
+    NETWORK_JSON = "\n".join([
+        '{"mode":"bridged","interface":"en0"}',
+        '{"mode":"host","gateway":"192.168.106.1","dhcpEnd":"192.168.106.254","netmask":"255.255.255.0"}',
+        '{"mode":"shared","gateway":"192.168.105.1","dhcpEnd":"192.168.105.254","netmask":"255.255.255.0"}',
+        '{"mode":"user-v2","gateway":"192.168.104.1","netmask":"255.255.255.0"}',
+        '{"mode":"user-v2","gateway":"192.168.105.1","netmask":"255.255.255.0"}',
+        '{"mode":"user-v2","gateway":"192.168.106.1","netmask":"255.255.255.0"}',
+    ])
+
+    # NOTE the singular "network" key — that's what `limactl list --json`
+    # actually emits (Instance struct tags it json:"network"). `airgap` is on
+    # the default slirp; `k3k-kube-ovn` is attached to two named user-v2
+    # networks via lima1/lima2 (egress has no IPv4 yet), with eth0 on the
+    # named "user-v2" network.
+    INSTANCES = [
+        {"name": "airgap", "status": "Running", "network": []},
+        {"name": "k3k-kube-ovn", "status": "Running", "network": [
+            {"lima": "user-v2-egress", "interface": "lima1",
+             "macAddress": "52:55:55:79:cd:57"},
+            {"lima": "user-v2-node", "interface": "lima2",
+             "macAddress": "52:55:55:96:87:6d"},
+        ]},
+        {"name": "builder", "status": "Stopped", "network": []},
+    ]
+
+    # Realistic `ip -d -j addr show` with CNI soup that must be filtered out.
+    GUEST = {
+        "airgap": json.dumps([
+            {"ifname": "lo", "link_type": "loopback", "address": "00:00:00:00:00:00",
+             "addr_info": [{"family": "inet", "local": "127.0.0.1"}]},
+            {"ifname": "eth0", "link_type": "ether", "address": "52:55:55:50:77:f1",
+             "addr_info": [{"family": "inet", "local": "192.168.5.15"}]},
+            {"ifname": "cni0", "link_type": "ether", "address": "1a:2b:3c:4d:5e:6f",
+             "linkinfo": {"info_kind": "bridge"},
+             "addr_info": [{"family": "inet", "local": "10.42.0.1"}]},
+            {"ifname": "flannel.1", "link_type": "ether", "address": "aa:bb:cc:00:11:22",
+             "linkinfo": {"info_kind": "vxlan"},
+             "addr_info": [{"family": "inet", "local": "10.42.0.0"}]},
+        ]),
+        "k3k-kube-ovn": json.dumps([
+            {"ifname": "lo", "link_type": "loopback", "address": "00:00:00:00:00:00",
+             "addr_info": [{"family": "inet", "local": "127.0.0.1"}]},
+            # eth0 is on the named "user-v2" net (104.x), not the default slirp.
+            {"ifname": "eth0", "link_type": "ether", "address": "52:55:55:38:fe:86",
+             "addr_info": [{"family": "inet", "local": "192.168.104.3"}]},
+            # lima1 = user-v2-egress, no IPv4 yet — matched by MAC/interface.
+            {"ifname": "lima1", "link_type": "ether", "address": "52:55:55:79:cd:57",
+             "addr_info": []},
+            # lima2 = user-v2-node (106.x).
+            {"ifname": "lima2", "link_type": "ether", "address": "52:55:55:96:87:6d",
+             "addr_info": [{"family": "inet", "local": "192.168.106.2"}]},
+            {"ifname": "cni0", "link_type": "ether", "address": "1a:2b:3c:4d:5e:70",
+             "linkinfo": {"info_kind": "bridge"},
+             "addr_info": [{"family": "inet", "local": "10.42.1.1"}]},
+            {"ifname": "ovn0", "link_type": "ether", "address": "ce:ce:ce:00:00:01",
+             "linkinfo": {"info_kind": "geneve"},
+             "addr_info": [{"family": "inet", "local": "10.16.0.1"}]},
+        ]),
+    }
+
+    def list_instances(self):
+        return self.INSTANCES
+
+    def guest_addr_json(self, name):
+        return self.GUEST.get(name, json.dumps([]))
+
+    def network_defs(self):
+        return merge_network_list(self.NETWORK_TABLE, self.NETWORK_JSON)
+
+
+# ----------------------------------------------------------------------------
+# Topology
+# ----------------------------------------------------------------------------
+
+def build_topology(backend, keep_virtual: bool = False) -> dict[str, VSwitch]:
+    try:
+        defs = backend.network_defs()
+    except Exception:
+        defs = {}
+
+    switches: dict[str, VSwitch] = {}
+
+    def ensure(label, kind, shared, subnet=None, gateway=None, iface=None) -> VSwitch:
+        sw = switches.get(label)
+        if sw is None:
+            sw = VSwitch(label, kind, shared, subnet, gateway, iface)
+            switches[label] = sw
+        return sw
+
+    # Pre-create every defined network so unused ones still appear.
+    for name, d in defs.items():
+        ensure(f"lima:{name}", d["mode"], d["mode"] in ("shared", "bridged", "host"),
+               d.get("cidr"), d.get("gateway"), d.get("interface"))
+
+    for inst in backend.list_instances():
+        name = inst.get("name", "?")
+        status = inst.get("status", "?")
+
+        reals: list[dict] = []
+        if status == "Running":
+            try:
+                reals = parse_guest_ifaces(backend.guest_addr_json(name), keep_virtual)
+            except Exception:
+                reals = []
+
+        consumed: set[str] = set()
+
+        def take(mac: str | None, iface: str | None) -> dict | None:
+            # Prefer MAC (authoritative), fall back to interface name.
+            if mac:
+                for r in reals:
+                    if r["mac"] not in consumed and r["mac"] == mac:
+                        consumed.add(r["mac"])
+                        return r
+            if iface:
+                for r in reals:
+                    if r["mac"] not in consumed and r["ifname"] == iface:
+                        consumed.add(r["mac"])
+                        return r
+            return None
+
+        # 1) Configured networks (host side, authoritative for the name).
+        for net in _instance_networks(inst):
+            label, kind, shared = _label_for(net, defs)
+            d = defs.get(net.get("lima", "")) or {}
+            sw = ensure(label, kind, shared, d.get("cidr"), d.get("gateway"), d.get("interface"))
+            r = take(net.get("macAddress"), net.get("interface"))
+            if r:
+                sw.nics.append(Nic(name, status, r["ifname"], r["mac"], r["ips"]))
+            else:
+                # Attached per config but no live NIC matched (e.g. stopped).
+                sw.nics.append(Nic(name, status,
+                                   net.get("interface") or "?",
+                                   net.get("macAddress") or "?", []))
+
+        # 2) Leftover real NICs: place by IP subnet, else the default NAT.
+        for r in reals:
+            if r["mac"] in consumed:
+                continue
+            placed = _match_subnet_label(r["ips"], defs)
+            if placed:
+                d = defs[placed]
+                sw = ensure(f"lima:{placed}", d["mode"],
+                            d["mode"] in ("shared", "bridged", "host"),
+                            d.get("cidr"), d.get("gateway"), d.get("interface"))
+            else:
+                sw = ensure(USER_V2, "user-v2", False, "192.168.5.0/24", "192.168.5.2")
+            sw.nics.append(Nic(name, status, r["ifname"], r["mac"], r["ips"]))
+
+    return switches
+
+
+# ----------------------------------------------------------------------------
+# Rendering
+# ----------------------------------------------------------------------------
+
+from rich.console import Group
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+
+def _status_style(status: str) -> str:
+    return {"Running": "green", "Stopped": "red"}.get(status, "yellow")
+
+
+def _ip_text(nic: Nic) -> Text:
+    if nic.ips:
+        return Text(", ".join(nic.ips), style="bold green")
+    if nic.status == "Running":
+        return Text("(no IPv4)", style="dim")
+    return Text("—", style="dim")
+
+
+def _meta(sw: VSwitch) -> str:
+    bits = []
+    if sw.subnet:
+        bits.append(sw.subnet)
+    if sw.gateway:
+        bits.append(f"gw {sw.gateway}")
+    if sw.iface:
+        bits.append(f"host {sw.iface}")
+    return "  ".join(bits)
+
+
+def _order(switches: dict[str, VSwitch]) -> list[VSwitch]:
+    return sorted(switches.values(), key=lambda s: (0 if s.shared else 1, s.name))
+
+
+def render_by_switch(switches: dict[str, VSwitch]) -> Group:
+    if not switches:
+        return Group(Text("No instances or networks found.", style="dim"))
+    panels = []
+    for sw in _order(switches):
+        if not sw.nics:
+            body = Text("(no VMs attached)", style="dim italic")
+        else:
+            grid = Table.grid(padding=(0, 2))
+            for _ in range(4):
+                grid.add_column()
+            for nic in sorted(sw.nics, key=lambda n: n.vm):
+                vm = Text("●─ ", style="cyan") + Text(nic.vm, style=f"bold {_status_style(nic.status)}")
+                grid.add_row(vm, Text(nic.ifname), Text(nic.mac, style="dim"), _ip_text(nic))
+            body = grid
+        tag = "vSwitch" if sw.shared else "NAT"
+        title = Text(f"⇄ {tag}  ", style="cyan") + Text(sw.name, style="bold cyan")
+        meta = _meta(sw)
+        if meta:
+            title += Text(f"   {meta}", style="dim")
+        sub = Text(f"{len(sw.nics)} port(s)" + ("" if sw.shared else " · isolated per VM"), style="dim")
+        panels.append(Panel(body, title=title, title_align="left", subtitle=sub,
+                            subtitle_align="right",
+                            border_style="cyan" if sw.shared else "yellow"))
+    return Group(*panels)
+
+
+def render_by_vm(switches: dict[str, VSwitch]) -> Group:
+    vms: dict[str, list[tuple[VSwitch, Nic]]] = {}
+    statuses: dict[str, str] = {}
+    for sw in switches.values():
+        for nic in sw.nics:
+            vms.setdefault(nic.vm, []).append((sw, nic))
+            statuses[nic.vm] = nic.status
+    if not vms:
+        return Group(Text("No instances found.", style="dim"))
+    panels = []
+    for vm in sorted(vms):
+        grid = Table.grid(padding=(0, 2))
+        for _ in range(4):
+            grid.add_column()
+        for sw, nic in sorted(vms[vm], key=lambda x: x[1].ifname):
+            grid.add_row(Text(nic.ifname, style="bold"),
+                         Text("→ ", style="cyan") + Text(sw.name, style="cyan"),
+                         Text(nic.mac, style="dim"), _ip_text(nic))
+        st = statuses[vm]
+        title = Text("🖥  ", style="white") + Text(vm, style="bold") + \
+            Text(f"  [{st}]", style=_status_style(st))
+        panels.append(Panel(grid, title=title, title_align="left", border_style=_status_style(st)))
+    return Group(*panels)
+
+
+def collect(backend, keep_virtual: bool = False) -> dict[str, VSwitch]:
+    return build_topology(backend, keep_virtual)
+
+
+# ----------------------------------------------------------------------------
+# Textual app
+# ----------------------------------------------------------------------------
+
+from textual import work
+from textual.app import App, ComposeResult
+from textual.containers import VerticalScroll
+from textual.widgets import Footer, Header, Static
+
+
+class LimaNetApp(App):
+    TITLE = "lima-net"
+    SUB_TITLE = "VM ⇄ vSwitch topology"
+    CSS = """
+    VerticalScroll { padding: 1 2; }
+    #diagram { width: 100%; }
+    """
+    BINDINGS = [
+        ("r", "refresh", "Refresh"),
+        ("t", "toggle", "Switch/VM view"),
+        ("q", "quit", "Quit"),
+    ]
+
+    def __init__(self, backend, keep_virtual: bool = False) -> None:
+        super().__init__()
+        self.backend = backend
+        self.keep_virtual = keep_virtual
+        self.by_vm = False
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with VerticalScroll():
+            yield Static(id="diagram")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.load_data()
+
+    def action_refresh(self) -> None:
+        self.load_data()
+
+    def action_toggle(self) -> None:
+        self.by_vm = not self.by_vm
+        self.sub_title = "VM → networks" if self.by_vm else "VM ⇄ vSwitch topology"
+        self.load_data()
+
+    @work(thread=True, exclusive=True)
+    def load_data(self) -> None:
+        panel = self.query_one("#diagram", Static)
+        self.call_from_thread(panel.update, Text("Collecting…", style="dim"))
+        try:
+            switches = collect(self.backend, self.keep_virtual)
+            renderable = render_by_vm(switches) if self.by_vm else render_by_switch(switches)
+        except FileNotFoundError:
+            renderable = Text("`limactl` not found in PATH. (Try --demo.)", style="bold red")
+        except subprocess.CalledProcessError as e:
+            renderable = Text(f"limactl failed:\n{e.stderr or e}", style="bold red")
+        except Exception as e:  # pragma: no cover
+            renderable = Text(f"Error: {e}", style="bold red")
+        self.call_from_thread(panel.update, renderable)
+
+
+# ----------------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="limactl net",
+        description="Draw which Lima VM is on which network (vSwitch), NIC and IP.",
+        epilog="Runs as a Lima CLI plugin when installed as `limactl-net` on PATH.",
+    )
+    ap.add_argument("--demo", action="store_true", help="use canned data, no Lima needed")
+    ap.add_argument("--print", dest="print_only", action="store_true",
+                    help="print the diagram to stdout and exit (no TUI)")
+    ap.add_argument("--by-vm", action="store_true", help="start in VM-centric view")
+    ap.add_argument("--all-ifaces", action="store_true",
+                    help="do NOT filter CNI/virtual interfaces (debug)")
+    ap.add_argument("--dump", action="store_true",
+                    help="diagnostic: print each VM's configured network[] and "
+                         "guest NICs, then exit")
+    ap.add_argument("--lima-home", default=None, help="override LIMA_HOME")
+    args = ap.parse_args()
+
+    backend = DemoBackend() if args.demo else RealBackend(lima_home=args.lima_home)
+
+    if args.dump:
+        defs = backend.network_defs()
+        print("# defined networks:")
+        for nm, d in defs.items():
+            print(f"    {nm:<18} {d.get('mode'):<8} {d.get('cidr') or '-'}")
+        for inst in backend.list_instances():
+            name, status = inst.get("name", "?"), inst.get("status", "?")
+            print(f"\n# {name} [{status}]")
+            print(f"    config network[]: {json.dumps(_instance_networks(inst))}")
+            if status != "Running":
+                continue
+            try:
+                reals = parse_guest_ifaces(backend.guest_addr_json(name), args.all_ifaces)
+            except Exception as e:
+                print(f"    (guest query failed: {e})")
+                continue
+            for r in reals:
+                print(f"    {r['ifname']:<8} {r['mac']:<18} {', '.join(r['ips']) or '-'}")
+        return
+
+    if args.print_only:
+        from rich.console import Console
+        switches = collect(backend, args.all_ifaces)
+        render = render_by_vm if args.by_vm else render_by_switch
+        Console().print(render(switches))
+        return
+
+    app = LimaNetApp(backend, keep_virtual=args.all_ifaces)
+    app.by_vm = args.by_vm
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
