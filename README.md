@@ -1,60 +1,41 @@
 # lima-net
 
 A small [Textual](https://textual.textualize.io/) TUI, packaged as a
-[Lima](https://github.com/lima-vm/lima) **CLI plugin** (`limactl-net`), that
+[Lima](https://github.com/lima-vm/lima) **CLI plugin** (`limactl-net-tui`), that
 draws which Lima VM is wired to which network (vSwitch), on which NIC, with
-which IP. Once installed on `PATH`, run it as `limactl net`.
+which IP. Once installed on `PATH`, run it as `limactl net-tui`.
 
 Lima keeps the *configured* networks (name + MAC + interface) on the host, but
 the IPs are handed out by DHCP **inside** the guest, so no single command joins
 the two. `lima-net` correlates them — by MAC, then interface name, then IP
 subnet — and renders one panel per network.
 
-```
-╭─ ⇄ NAT  lima:user-v2-egress   192.168.105.0/24  gw 192.168.105.1 ────────────╮
-│ ●─ k3k-kube-ovn  lima1  52:55:55:79:cd:57  (no IPv4)                         │
-╰──────────────────────────────────────────────── 1 port(s) · isolated per VM ─╯
-╭─ ⇄ NAT  lima:user-v2-node   192.168.106.0/24  gw 192.168.106.1 ──────────────╮
-│ ●─ k3k-kube-ovn  lima2  52:55:55:96:87:6d  192.168.106.2                     │
-╰──────────────────────────────────────────────── 1 port(s) · isolated per VM ─╯
-╭─ ⇄ NAT  usermode NAT (default, per-VM)   192.168.5.0/24  gw 192.168.5.2 ─────╮
-│ ●─ airgap  eth0  52:55:55:50:77:f1  192.168.5.15                            │
-╰──────────────────────────────────────────────── 1 port(s) · isolated per VM ─╯
-```
+### vSwitch View (default)
+![vSwitch View](networks-view.png)
+
+### VM View (toggled with `t`)
+![VM View](vms-view.png)
 
 ## Install as a Lima plugin
 
-Lima (>= 2.0) discovers any executable named `limactl-<name>` on `PATH` and
-exposes it as `limactl <name>` (like `git`/`kubectl`/`docker`). The file is
-`limactl-net`:
+Make `limactl-net-tui` executable and copy it to a directory on your `PATH` (e.g., `~/.local/bin/`):
 
 ```sh
-chmod +x limactl-net
-mkdir -p ~/.local/bin && cp limactl-net ~/.local/bin/   # ensure ~/.local/bin is on PATH
-limactl net                                             # now available as a subcommand
+chmod +x limactl-net-tui
+cp limactl-net-tui ~/.local/bin/
 ```
 
-Package managers can instead drop it in `<PREFIX>/libexec/lima/` (e.g.
-`/opt/homebrew/libexec/lima/`), which Lima also scans.
-
-Once installed it shows up in `limactl --help` (Available Plugins) and
-`limactl info` (JSON `plugins`), with the description taken from the
-`<limactl-desc>` comment in the file.
-
-**Requirements:** Lima >= 2.0 (CLI plugins are experimental) and
-[`uv`](https://docs.astral.sh/uv/) on `PATH`. The shebang is
-`#!/usr/bin/env -S uv run --script`, so the first run resolves and caches the
-Python deps (textual, pyyaml) automatically — no venv, no `sudo`. If you'd
-rather not use uv, change the shebang to `#!/usr/bin/env python3` and install
-the deps yourself.
+**Requirements:**
+- **Lima >= 2.0**
+- [**`uv`**](https://docs.astral.sh/uv/) on `PATH` (resolves Python dependencies automatically on the first run via its inline PEP 723 metadata)
 
 ## Run
 
 ```sh
-limactl net                  # as a plugin
-limactl net --demo           # canned data, no Lima needed
-./limactl-net --demo         # direct execution (uv shebang bootstraps deps)
-uv run limactl-net --demo    # explicit
+limactl net-tui                  # as a plugin
+limactl net-tui --demo           # canned data, no Lima needed
+./limactl-net-tui --demo         # direct execution (uv shebang bootstraps deps)
+uv run limactl-net-tui --demo    # explicit
 ```
 
 ### Keys
@@ -114,6 +95,8 @@ everything (debugging).
 
 ## Known upstream issues (worked around)
 
+Both issues are tracked upstream in [lima-vm/lima#5178](https://github.com/lima-vm/lima/issues/5178).
+
 **1. `network list --json` drops the name.** The name is the map key in limactl
 and never lands in the marshalled object, so JSON rows are anonymous while the
 plain table still prints `NAME`. This matters when networks differ only by name
@@ -128,8 +111,6 @@ array is emitted under `network`, not `networks` (the `Instance` struct tags it
 Reading the wrong key makes *every* NIC fall through to the default-NAT bucket.
 `lima-net` reads `network`, then `networks`, then nested `config.networks`, and
 finally the on-disk `lima.yaml` (via the instance's `dir`) as a fallback.
-
-No tracking issue existed upstream for either at the time of writing.
 
 ## Caveats
 
@@ -146,4 +127,3 @@ No tracking issue existed upstream for either at the time of writing.
 - IPv6 is not shown (IPv4 only). Easy to add.
 - Schema parsing targets the current limactl output. If a field moves, the blast
   radius is `merge_network_list`, `parse_networks_yaml`, and `_instance_networks`.
-# lima-tui

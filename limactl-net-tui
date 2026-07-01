@@ -5,10 +5,10 @@
 # ///
 # <limactl-desc>Draw which Lima VM is on which network (vSwitch), NIC and IP</limactl-desc>
 """
-limactl-net — a Lima CLI plugin (a Textual TUI) that draws which Lima VM is
+limactl-net-tui — a Lima CLI plugin (a Textual TUI) that draws which Lima VM is
 wired to which network (vSwitch), on which NIC, with which IP.
 
-Installed as `limactl-net` on PATH, it runs as `limactl net`.
+Installed as `limactl-net-tui` on PATH, it runs as `limactl net-tui`.
 
 Each Lima network is one vSwitch panel. Networks come from
 `limactl network list` (for names) zipped with `--json` (for details) — a
@@ -22,11 +22,11 @@ is filtered out: those are virtual devices with an `info_kind`; a real VM NIC is
 virtio with none. The built-in usermode network is shown separately as a
 per-VM NAT, not a shared bus.
 
-    limactl net                # as a plugin (after install; see README)
-    ./limactl-net --demo       # direct; the uv shebang installs deps
-    uv run limactl-net --demo  # canned data, no Lima needed
-    limactl net --print        # dump to stdout, no TUI
-    limactl net --dump         # diagnostic: config network[] vs guest NICs
+    limactl net-tui            # as a plugin (after install; see README)
+    ./limactl-net-tui --demo   # direct; the uv shebang installs deps
+    uv run limactl-net-tui --demo  # canned data, no Lima needed
+    limactl net-tui --print        # dump to stdout, no TUI
+    limactl net-tui --dump         # diagnostic: config network[] vs guest NICs
 
 Keys:  r refresh   t toggle vSwitch / VM view   q quit
 """
@@ -599,9 +599,9 @@ class LimaNetApp(App):
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        prog="limactl net",
+        prog="limactl net-tui",
         description="Draw which Lima VM is on which network (vSwitch), NIC and IP.",
-        epilog="Runs as a Lima CLI plugin when installed as `limactl-net` on PATH.",
+        epilog="Runs as a Lima CLI plugin when installed as `limactl-net-tui` on PATH.",
     )
     ap.add_argument("--demo", action="store_true", help="use canned data, no Lima needed")
     ap.add_argument("--print", dest="print_only", action="store_true",

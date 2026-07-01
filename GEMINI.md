@@ -6,8 +6,8 @@ NICs, and IPs.
 
 ## What this project is
 
-One executable file, `limactl-net` (no extension — that's the Lima plugin
-naming convention; `limactl net` runs `limactl-net` from PATH). No package, no
+One executable file, `limactl-net-tui` (no extension — that's the Lima plugin
+naming convention; `limactl net-tui` runs `limactl-net-tui` from PATH). No package, no
 build step. Self-bootstrapping via a `#!/usr/bin/env -S uv run --script`
 shebang with PEP 723 inline deps (`textual`, `pyyaml`). Target environment is a
 no-sudo Apple Silicon Mac; do not introduce steps that need root or a system
@@ -18,8 +18,8 @@ package manager.
   files that start with `#!`.
 - Keep the `# <limactl-desc>…</limactl-desc>` comment near the top — it's what
   `limactl --help` and `limactl info` display.
-- The file stays named `limactl-net` and executable (`chmod +x`).
-- argparse `prog` is `limactl net` so `--help` reads correctly under Lima.
+- The file stays named `limactl-net-tui` and executable (`chmod +x`).
+- argparse `prog` is `limactl net-tui` so `--help` reads correctly under Lima.
 
 ## Layout of the single file (top to bottom)
 
@@ -41,15 +41,15 @@ package manager.
 ## Run / smoke-test
 
 There is no pytest suite; the demo path is the smoke test. Run these after a
-change before declaring done (use `python limactl-net` in a sandbox without uv,
-or `./limactl-net` to also exercise the uv shebang):
+change before declaring done (use `python limactl-net-tui` in a sandbox without uv,
+or `./limactl-net-tui` to also exercise the uv shebang):
 
 ```sh
-python limactl-net --print --demo            # vSwitch view
-python limactl-net --print --demo --by-vm    # VM view
-python limactl-net --print --demo --all-ifaces   # CNI NOT filtered (contrast)
-python limactl-net --dump --demo             # diagnostic: config network[] vs guest NICs
-./limactl-net --print --demo                 # exercises the uv-shebang plugin path
+python limactl-net-tui --print --demo            # vSwitch view
+python limactl-net-tui --print --demo --by-vm    # VM view
+python limactl-net-tui --print --demo --all-ifaces   # CNI NOT filtered (contrast)
+python limactl-net-tui --dump --demo             # diagnostic: config network[] vs guest NICs
+./limactl-net-tui --print --demo                 # exercises the uv-shebang plugin path
 ```
 
 Headless TUI check (boots app, runs worker, exercises the `t` toggle):
@@ -58,7 +58,7 @@ Headless TUI check (boots app, runs worker, exercises the `t` toggle):
 python - <<'PY'
 import sys, importlib.util, importlib.machinery, asyncio
 spec = importlib.util.spec_from_loader("limactl_net",
-        importlib.machinery.SourceFileLoader("limactl_net", "limactl-net"))
+        importlib.machinery.SourceFileLoader("limactl_net", "limactl-net-tui"))
 m = importlib.util.module_from_spec(spec)
 sys.modules["limactl_net"] = m          # needed so @dataclass can resolve the module
 spec.loader.exec_module(m)
